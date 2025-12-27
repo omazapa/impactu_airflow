@@ -17,7 +17,7 @@ default_args = {
 
 def run_extraction_by_year(year, **kwargs):
     # Get params from DAG
-    force_redownload = kwargs['params'].get('force_redownload', False)
+    force_redownload = kwargs['params'].get('force_redownload', True)
     chunk_size = kwargs['params'].get('chunk_size', 1000)
     
     # Use MongoHook to get the connection
@@ -31,18 +31,6 @@ def run_extraction_by_year(year, **kwargs):
     finally:
         extractor.close()
 
-def create_indexes(**kwargs):
-    hook = MongoHook(mongo_conn_id='mongodb_default')
-    client = hook.get_conn()
-    db_name = hook.connection.schema or 'impactu'
-    db = client[db_name]
-    collection = db['scimagojr']
-    
-    # Create index on Sourceid and year to optimize upserts and avoid COLLSCAN
-    # We use a regular index first to ensure it's created even if duplicates exist.
-    # The extractor will handle the cleanup year by year.
-    collection.create_index([('Sourceid', 1), ('year', 1)])
-
 with DAG(
     'extract_scimagojr',
     default_args=default_args,
@@ -51,21 +39,14 @@ with DAG(
     catchup=False,
     tags=['extract', 'scimagojr'],
     params={
-        "force_redownload": Param(False, type="boolean", description="Force data download even if already in cache or database"),
+        "force_redownload": Param(True, type="boolean", description="Force data download even if already in cache or database"),
         "chunk_size": Param(1000, type="integer", description="Number of records to insert in each bulk operation"),
     },
 ) as dag:
 
     years = list(range(1999, datetime.now().year + 1))
 
-    setup_task = PythonOperator(
-        task_id='create_indexes',
-        python_callable=create_indexes,
-    )
-
     extract_task = PythonOperator.partial(
         task_id='extract_and_load_scimagojr',
         python_callable=run_extraction_by_year,
     ).expand(op_kwargs=[{'year': year} for year in years])
-
-    setup_task >> extract_task

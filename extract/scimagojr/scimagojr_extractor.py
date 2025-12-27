@@ -13,6 +13,31 @@ class ScimagoJRExtractor(BaseExtractor):
         self.cache_dir = cache_dir
         if not os.path.exists(self.cache_dir):
             os.makedirs(self.cache_dir, exist_ok=True)
+        self.create_indexes()
+
+    def create_indexes(self):
+        """Ensures unique indexes for Sourceid and year, handling conflicts with existing non-unique indexes."""
+        self.logger.info("Ensuring indexes for scimagojr collection...")
+        index_name = "Sourceid_1_year_1"
+        try:
+            self.collection.create_index([("Sourceid", 1), ("year", 1)], unique=True, name=index_name)
+        except Exception as e:
+            if "IndexKeySpecsConflict" in str(e) or "already exists with different options" in str(e):
+                self.logger.warning(f"Index conflict detected for {index_name}. Dropping and recreating as unique...")
+                self.collection.drop_index(index_name)
+                try:
+                    self.collection.create_index([("Sourceid", 1), ("year", 1)], unique=True, name=index_name)
+                except Exception as e2:
+                    if "duplicate key error" in str(e2).lower():
+                        self.logger.error(f"Could not create unique index {index_name} due to existing duplicates. "
+                                         "The extractor will attempt to clean them up during processing.")
+                        # Create a non-unique index as fallback so queries are still fast
+                        self.collection.create_index([("Sourceid", 1), ("year", 1)], name=index_name)
+                    else:
+                        raise e2
+            else:
+                raise e
+        self.collection.create_index("year")
 
     def fetch_year(self, year, force_redownload=False):
         """Downloads and parses the CSV for a specific year, using cache if available."""
@@ -66,8 +91,8 @@ class ScimagoJRExtractor(BaseExtractor):
         
         return df.to_dict('records')
 
-    def process_year(self, year, force_redownload=False, chunk_size=1000):
-        """Downloads and updates a single year in MongoDB."""
+    def process_year(self, year, force_redownload=True, chunk_size=1000):
+        """Downloads and updates a single year in MongoDB using a differential strategy."""
         start_time = time.time()
         try:
             fetch_start = time.time()
@@ -81,12 +106,40 @@ class ScimagoJRExtractor(BaseExtractor):
             total_records = len(data)
             self.logger.info(f"Processing {total_records} records for year {year}...")
             
-            sanitization_start = time.time()
+            # 1. Get existing records for this year to compare
+            existing_records = {doc['Sourceid']: doc for doc in self.collection.find({"year": year})}
+            
             operations = []
+            updates_count = 0
+            inserts_count = 0
+            skipped_count = 0
+
             for record in data:
-                # Use Sourceid and year as unique identifier
                 source_id = record.get('Sourceid')
-                if source_id:
+                if not source_id:
+                    continue
+                
+                if source_id in existing_records:
+                    # Compare records (excluding _id)
+                    existing_record = existing_records[source_id]
+                    record_to_compare = record.copy()
+                    
+                    # Remove _id from existing for comparison
+                    existing_id = existing_record.pop('_id', None)
+                    
+                    if record != existing_record:
+                        # Content changed, update
+                        operations.append(
+                            UpdateOne(
+                                {"Sourceid": source_id, "year": year},
+                                {"$set": record}
+                            )
+                        )
+                        updates_count += 1
+                    else:
+                        skipped_count += 1
+                else:
+                    # New record, insert
                     operations.append(
                         UpdateOne(
                             {"Sourceid": source_id, "year": year},
@@ -94,7 +147,9 @@ class ScimagoJRExtractor(BaseExtractor):
                             upsert=True
                         )
                     )
-            sanitization_end = time.time()
+                    inserts_count += 1
+            
+            self.logger.info(f"Year {year}: {inserts_count} to insert, {updates_count} to update, {skipped_count} unchanged.")
             
             if operations:
                 total_ops = len(operations)
@@ -104,29 +159,31 @@ class ScimagoJRExtractor(BaseExtractor):
                 for i in range(0, total_ops, chunk_size):
                     chunk = operations[i:i + chunk_size]
                     bw_start = time.time()
-                    result = self.collection.bulk_write(chunk, ordered=False)
+                    self.collection.bulk_write(chunk, ordered=False)
                     bw_end = time.time()
                     bulk_write_total_time += (bw_end - bw_start)
                     
                     processed += len(chunk)
-                    self.logger.info(f"Year {year}: Progress {processed}/{total_ops} records ({(processed/total_ops)*100:.1f}%)")
+                    self.logger.info(f"Year {year}: Progress {processed}/{total_ops} operations ({(processed/total_ops)*100:.1f}%)")
                 
                 end_time = time.time()
                 self.logger.info(
                     f"Year {year} performance breakdown:\n"
                     f"  - Fetching: {fetch_end - fetch_start:.2f}s\n"
-                    f"  - Sanitization: {sanitization_end - sanitization_start:.2f}s\n"
+                    f"  - Differential Analysis: {time.time() - fetch_end:.2f}s\n"
                     f"  - Bulk Write (Total): {bulk_write_total_time:.2f}s\n"
                     f"  - Total Time: {end_time - start_time:.2f}s"
                 )
                 
-                # Cleanup duplicates if count doesn't match
+                # Cleanup duplicates and verify count
                 self.cleanup_year(year, total_records)
                 
                 self.save_checkpoint(f"scimagojr_{year}", "completed")
                 return True
             
-            return None
+            self.logger.info(f"Year {year}: No changes detected. Skipping database write.")
+            self.save_checkpoint(f"scimagojr_{year}", "completed")
+            return True
             
         except Exception as e:
             self.logger.error(f"Error processing year {year}: {e}")
@@ -159,7 +216,7 @@ class ScimagoJRExtractor(BaseExtractor):
         else:
             self.logger.warning(f"Year {year}: Found fewer records ({actual_count}) than expected ({expected_count}).")
 
-    def run(self, start_year, end_year, force_redownload=False, chunk_size=1000):
+    def run(self, start_year, end_year, force_redownload=True, chunk_size=1000):
         """Runs the extraction for a range of years, updating only changed records."""
         for year in range(start_year, end_year + 1):
             self.process_year(year, force_redownload=force_redownload, chunk_size=chunk_size)
