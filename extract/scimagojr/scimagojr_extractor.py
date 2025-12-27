@@ -52,14 +52,28 @@ class ScimagoJRExtractor(BaseExtractor):
         
         # Scimago returns a CSV with semicolon separator even if it says xls
         df = pd.read_csv(io.StringIO(content), sep=';', low_memory=False)
-        df['year'] = year
+        
+        # Ensure Sourceid is consistent and unique
+        if 'Sourceid' in df.columns:
+            df['Sourceid'] = pd.to_numeric(df['Sourceid'], errors='coerce').fillna(0).astype(int)
+            df = df.drop_duplicates(subset=['Sourceid'])
+        
+        df['year'] = int(year)
+        
+        # Optimization: Sanitize columns and handle NaN using Pandas
+        df.columns = [c.replace('.', '_') for c in df.columns]
+        df = df.where(pd.notnull(df), None)
+        
         return df.to_dict('records')
 
     def process_year(self, year, force_redownload=False, chunk_size=1000):
         """Downloads and updates a single year in MongoDB."""
         start_time = time.time()
         try:
+            fetch_start = time.time()
             data = self.fetch_year(year, force_redownload=force_redownload)
+            fetch_end = time.time()
+            
             if not data:
                 self.logger.warning(f"No data found for year {year}")
                 return None
@@ -67,39 +81,43 @@ class ScimagoJRExtractor(BaseExtractor):
             total_records = len(data)
             self.logger.info(f"Processing {total_records} records for year {year}...")
             
+            sanitization_start = time.time()
             operations = []
             for record in data:
-                # Sanitize keys (replace dots) and handle NaN
-                sanitized_record = {
-                    k.replace('.', '_'): (None if pd.isna(v) else v) 
-                    for k, v in record.items()
-                }
-                
                 # Use Sourceid and year as unique identifier
-                source_id = sanitized_record.get('Sourceid')
+                source_id = record.get('Sourceid')
                 if source_id:
                     operations.append(
                         UpdateOne(
                             {"Sourceid": source_id, "year": year},
-                            {"$set": sanitized_record},
+                            {"$set": record},
                             upsert=True
                         )
                     )
+            sanitization_end = time.time()
             
             if operations:
                 total_ops = len(operations)
                 processed = 0
+                bulk_write_total_time = 0
                 
                 for i in range(0, total_ops, chunk_size):
                     chunk = operations[i:i + chunk_size]
+                    bw_start = time.time()
                     result = self.collection.bulk_write(chunk, ordered=False)
+                    bw_end = time.time()
+                    bulk_write_total_time += (bw_end - bw_start)
+                    
                     processed += len(chunk)
                     self.logger.info(f"Year {year}: Progress {processed}/{total_ops} records ({(processed/total_ops)*100:.1f}%)")
                 
                 end_time = time.time()
                 self.logger.info(
-                    f"Year {year} completed in {end_time - start_time:.2f} seconds. "
-                    f"Total records processed: {total_ops}"
+                    f"Year {year} performance breakdown:\n"
+                    f"  - Fetching: {fetch_end - fetch_start:.2f}s\n"
+                    f"  - Sanitization: {sanitization_end - sanitization_start:.2f}s\n"
+                    f"  - Bulk Write (Total): {bulk_write_total_time:.2f}s\n"
+                    f"  - Total Time: {end_time - start_time:.2f}s"
                 )
                 self.save_checkpoint(f"scimagojr_{year}", "completed")
                 return True

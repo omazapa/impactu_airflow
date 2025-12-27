@@ -31,6 +31,36 @@ def run_extraction_by_year(year, **kwargs):
     finally:
         extractor.close()
 
+def create_indexes(**kwargs):
+    hook = MongoHook(mongo_conn_id='mongodb_default')
+    client = hook.get_conn()
+    db_name = hook.connection.schema or 'impactu'
+    db = client[db_name]
+    collection = db['scimagojr']
+    
+    # Cleanup: Remove duplicates before creating unique index
+    # This is a one-time cleanup that ensures the unique index can be created
+    pipeline = [
+        {"$group": {
+            "_id": {"Sourceid": "$Sourceid", "year": "$year"},
+            "dups": {"$push": "$_id"},
+            "count": {"$sum": 1}
+        }},
+        {"$match": {"count": {"$gt": 1}}}
+    ]
+    
+    duplicates = list(collection.aggregate(pipeline))
+    if duplicates:
+        print(f"Found {len(duplicates)} groups of duplicate records. Cleaning up...")
+        for doc in duplicates:
+            # Keep the first one, delete the rest
+            ids_to_delete = doc['dups'][1:]
+            collection.delete_many({"_id": {"$in": ids_to_delete}})
+        print("Cleanup finished.")
+
+    # Create unique index on Sourceid and year to optimize upserts and prevent duplicates
+    collection.create_index([('Sourceid', 1), ('year', 1)], unique=True)
+
 with DAG(
     'extract_scimagojr',
     default_args=default_args,
@@ -46,7 +76,14 @@ with DAG(
 
     years = list(range(1999, datetime.now().year + 1))
 
+    setup_task = PythonOperator(
+        task_id='create_indexes',
+        python_callable=create_indexes,
+    )
+
     extract_task = PythonOperator.partial(
         task_id='extract_and_load_scimagojr',
         python_callable=run_extraction_by_year,
     ).expand(op_kwargs=[{'year': year} for year in years])
+
+    setup_task >> extract_task
