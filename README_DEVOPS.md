@@ -1,59 +1,78 @@
-# Estrategia de DevOps para ImpactU Airflow
+# DevOps Strategy for ImpactU Airflow
 
-Este documento detalla la estrategia profesional de CI/CD, gestión de entornos y despliegue para el monorepositorio `impactu_airflow`.
+This document details the professional CI/CD strategy, environment management, and deployment for the `impactu_airflow` monorepo.
 
-## 1. Arquitectura de Imágenes (Decoupled Strategy)
+## 1. DAG Bundles Architecture (Airflow 3.x)
 
-Para optimizar los tiempos de construcción y garantizar la estabilidad, utilizamos una estrategia de imágenes desacoplada:
+For the production environment, we use **DAG Bundles**. This native Airflow 3 feature allows the Scheduler and Webserver to consume DAGs directly from Git, eliminating the need to rebuild Docker images or restart services to update process logic.
 
-- **Imagen Base (Infraestructura - Repositorio `Chia`)**: Contiene Airflow, dependencias del sistema (build-essential, git, etc.) y librerías de Python pesadas.
-  - `colav/impactu_airflow:base-latest` (para Desarrollo)
-  - `colav/impactu_airflow:base-3.1.0` (para Producción)
-- **Imagen de Lógica (Este Repositorio)**: Construye sobre la imagen base e inyecta únicamente el código de los DAGs, extractores, transformadores y cargadores.
-  - `colav/impactu_airflow:latest` (Desarrollo)
-  - `colav/impactu_airflow:v*` (Producción)
+- **Infrastructure (`Chia` Repository)**: Remains static. Provides the Airflow engine and base dependencies.
+- **Logic (This Repository)**: Changes in the `main` branch are automatically reflected in the production server.
 
-## 2. Estrategia de Ramas y Entornos
+## 2. Production Strategy
 
-| Entorno | Rama/Trigger | URL | Puerto | Docker Project |
-| :--- | :--- | :--- | :--- | :--- |
-| **Desarrollo (Dev)** | Push a `main` | `dev.airflow.colav.co` | 8081 | `airflow-dev` |
-| **Producción (Prod)** | Creación de Tag `v*` | `airflow.colav.co` | 8080 | `airflow-prod` |
+| Environment | Branch | URL | Bundle Name |
+| :--- | :--- | :--- | :--- |
+| **Production** | `main` | `airflow.colav.co` | `impactu_prod` |
 
-### Flujo de Trabajo (GitFlow Simplificado)
-1. Los desarrolladores trabajan en ramas de características (`feat/`, `fix/`).
-2. Se abre un Pull Request (PR) hacia `main`.
-3. El CI ejecuta pruebas de integridad y unitarias.
-4. Al hacer merge a `main`, el CD despliega automáticamente a **Dev**.
-5. Cuando el código es estable, se crea un tag (ej. `v1.0.0`) para desplegar a **Prod**.
+### Workflow
+1. Developers perform a **fork** of the official repository.
+2. Changes are developed in fork branches and validated locally.
+3. A **Pull Request (PR)** is opened from the fork to the `main` branch of the official repository.
+4. CI runs automatic tests and, if necessary, a remote validation in the development environment.
+5. Once approved and merged into `main`, the Airflow **DAG Processor** in production detects the update and synchronizes files in real-time.
 
-## 3. Pipeline de CI/CD (GitHub Actions)
+## 3. Production Server Configuration
 
-El archivo `.github/workflows/deploy.yml` gestiona el ciclo de vida:
+To enable automatic synchronization and ensure that internal dependencies (such as the `extract/` package) are importable, the following environment variable must be configured on the production server.
 
-### Fase de Test
-- **Integridad de DAGs**: Verifica que todos los archivos en `dags/` sean parseables por Airflow.
-- **Pruebas Unitarias**: Ejecuta `pytest` sobre los extractores y lógica de transformación usando `mongomock`.
-- **Validación Remota (PRs)**: Cuando se abre un PR, el CI notifica al API de Airflow en Desarrollo para ejecutar el DAG `pr_validator`. Este DAG descarga los cambios del PR y los valida en el entorno real de Dev sin necesidad de desplegar la imagen completa.
+**Note:** We use `"subdir": "."` so that the repository root is added to the `PYTHONPATH`, allowing DAGs to import modules from other folders. An `.airflowignore` file is included to prevent Airflow from attempting to process folders that do not contain DAGs.
 
-### Fase de Build & Push
-- Construye la imagen de Docker usando `build-args` para seleccionar la imagen base correcta.
-- Publica en Docker Hub.
-- **Nota**: El despliegue final en el servidor se gestiona de forma independiente desde el repositorio de infraestructura (`Chia`). Este repositorio solo se encarga de la entrega continua (Continuous Delivery) de las imágenes.
+```bash
+AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST='[
+    {
+        "name": "impactu_prod",
+        "classpath": "airflow.providers.git.bundles.git.GitDagBundle",
+        "kwargs": {
+            "git_conn_id": "git_impactu",
+            "tracking_ref": "main",
+            "refresh_interval": 300,
+            "subdir": "."
+        }
+    }
+]'
+```
 
-## 4. Gestión de Secretos y Configuración
+### Requirement: Git Connection
+In the Airflow interface (`Admin -> Connections`), a connection with ID `git_impactu` must exist:
+- **Conn Id**: `git_impactu`
+- **Conn Type**: `Git`
+- **Host**: `https://github.com/colav/impactu_airflow.git`
+
+## 4. CI/CD Pipeline (GitHub Actions)
+
+The `.github/workflows/deploy.yml` file manages the lifecycle:
+
+### Test Phase
+- **DAG Integrity**: Verifies that all files in `dags/` are parseable by Airflow.
+- **Unit Tests**: Runs `pytest` on extractors and transformation logic using `mongomock`.
+- **Remote Validation (PRs)**: When a PR is opened, CI notifies the Development Airflow API to run the `pr_validator` DAG. This DAG downloads the PR changes and validates them in the real Dev environment without needing to deploy the full image.
+
+### Deployment Phase
+- **Production**: Deployment is continuous. Upon merging changes into `main`, the production server automatically synchronizes the code via the `impactu_prod` bundle. No manual intervention or container restart is required.
+
+## 5. Secrets and Configuration Management
 
 ### GitHub Secrets
-- `DOCKER_HUB_USERNAME` / `DOCKER_HUB_TOKEN`: Para publicar imágenes en el registro.
-- `AIRFLOW_API_USER` / `AIRFLOW_API_PASSWORD`: Credenciales para que el CI pueda disparar validaciones en el servidor de Desarrollo.
-- `GH_TOKEN_PR_VALIDATOR`: Token de GitHub (Personal Access Token) con permisos de lectura para que el DAG validador pueda descargar los archivos del PR.
+- `AIRFLOW_API_USER` / `AIRFLOW_API_PASSWORD`: Credentials for CI to trigger validations on the Development server.
+- `GH_TOKEN_PR_VALIDATOR`: GitHub Token (Personal Access Token) with read permissions for the validator DAG to download PR files.
 
 ### Airflow (Runtime)
-- **Variables**: Configuraciones no sensibles (ej. `scimagojr_cache_dir`).
-- **Connections**: Credenciales de bases de datos (MongoDB, Postgres) y APIs. **Nunca** hardcodear credenciales en el código.
+- **Variables**: Non-sensitive configurations (e.g., `scimagojr_cache_dir`).
+- **Connections**: Database credentials (MongoDB, Postgres) and APIs. **Never** hardcode credentials in the code.
 
-## 5. Monitoreo y Mantenimiento
+## 6. Monitoring and Maintenance
 
-- **Logs**: Centralizados en `/storage/airflow/data/dev/logs` y `/storage/airflow/data/prod/logs`.
-- **Backups**: Los volúmenes de MongoDB y Postgres deben ser respaldados periódicamente (ver carpeta `backups/`).
-- **Alertas**: Se recomienda configurar un `Sentry` o un Notificador de Slack en Airflow para fallos críticos en los DAGs.
+- **Logs**: Centralized in `/storage/airflow/data/dev/logs` and `/storage/airflow/data/prod/logs`.
+- **Backups**: MongoDB and Postgres volumes must be backed up periodically (see `backups/` folder).
+- **Alerts**: It is recommended to configure `Sentry` or a Slack Notifier in Airflow for critical DAG failures.
