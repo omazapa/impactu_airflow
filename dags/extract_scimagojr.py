@@ -3,9 +3,9 @@
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.models.param import Param
-from airflow.operators.python import PythonOperator
 from airflow.providers.mongo.hooks.mongo import MongoHook
+from airflow.providers.standard.operators.python import PythonOperator
+from airflow.sdk import Param
 
 from extract.scimagojr.scimagojr_extractor import ScimagoJRExtractor
 
