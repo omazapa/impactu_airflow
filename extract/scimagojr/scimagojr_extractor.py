@@ -203,10 +203,10 @@ class ScimagoJRExtractor(BaseExtractor):
                     # Compare records (excluding _id)
                     existing_record = existing_records[source_id]
 
-                    # Remove _id from existing for comparison
-                    existing_record.pop("_id", None)
+                    # Build a comparison copy without MongoDB _id
+                    existing_record_no_id = {k: v for k, v in existing_record.items() if k != "_id"}
 
-                    if record != existing_record:
+                    if record != existing_record_no_id:
                         # Content changed, update
                         operations.append(
                             UpdateOne({"Sourceid": source_id, "year": year}, {"$set": record})
