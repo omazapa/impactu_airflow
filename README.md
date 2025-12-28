@@ -1,3 +1,8 @@
+
+
+<center><img src="https://raw.githubusercontent.com/colav/colav.github.io/master/img/Logo.png"/></center>
+
+[![Validate and Test DAGs](https://github.com/omazapa/impactu_airflow/actions/workflows/deploy.yml/badge.svg)](https://github.com/omazapa/impactu_airflow/actions/workflows/deploy.yml)
 # ImpactU Airflow ETL
 
 Central repository for Apache Airflow DAGs for the Extraction, Transformation, and Loading (ETL) processes of the ImpactU project.
