@@ -59,7 +59,7 @@ The `.github/workflows/deploy.yml` file manages the lifecycle:
 - **Remote Validation (PRs)**: When a PR is opened, CI notifies the Development Airflow API to run the `pr_validator` DAG. This DAG downloads the PR changes and validates them in the real Dev environment without needing to deploy the full image.
 
 ### Deployment Phase
-- **PyPI Publication**: Upon merging into `main`, a GitHub Action builds and publishes the package to PyPI.
+- **PyPI Publication**: When a new release is published on GitHub, a workflow automatically builds and publishes the package to PyPI.
 - **Production Sync**: The production server automatically synchronizes the DAG code via the `impactu_prod` bundle.
 
 ## 5. Secrets and Configuration Management
