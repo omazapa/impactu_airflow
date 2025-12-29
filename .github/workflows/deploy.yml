@@ -86,7 +86,6 @@ jobs:
           pytest tests/etl/test_scimagojr.py
 
   validate-on-dev:
-    needs: test
     runs-on: ubuntu-latest
     # Use pull_request_target to access secrets from forks
     # Only runs when a maintainer adds the "validate-on-dev" label
@@ -99,6 +98,7 @@ jobs:
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
 
       - name: Trigger PR Validation on Dev Airflow
         id: trigger_dag
